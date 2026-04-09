@@ -68,6 +68,12 @@ class CallSignature:
     intent_by_dummy: Dict[str, str]  # in/out/inout
 
 
+@dataclass
+class CallAnnotationEdit:
+    end_line: int
+    comments: List[str]
+
+
 def is_whole_dummy_write(lhs: str, dummy: str, is_array: bool) -> bool:
     """Return True when lhs denotes a whole-dummy assignment, not a subobject."""
     lhs_s = lhs.strip().lower()
@@ -1032,6 +1038,135 @@ def resolve_call_formal_intent(
     return sig.intent_by_dummy.get(formal)
 
 
+def parse_call_statement(stmt: str) -> Tuple[str, List[str]]:
+    """Parse CALL name(actuals) from one joined statement."""
+    m = re.match(r"^\s*call\s+([a-z][a-z0-9_]*)\s*(.*)$", stmt.strip(), re.IGNORECASE)
+    if not m:
+        return "", []
+    name = m.group(1).lower()
+    tail = m.group(2).strip()
+    if not tail.startswith("("):
+        return name, []
+    depth = 0
+    endp = -1
+    in_single = False
+    in_double = False
+    for i, ch in enumerate(tail):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if in_single or in_double:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                endp = i
+                break
+    if endp < 0:
+        return name, []
+    inner = tail[1:endp].strip()
+    return name, (split_decl_entities(inner) if inner else [])
+
+
+def build_call_annotation_comments(stmt: str, sig: CallSignature, indent: str) -> List[str]:
+    """Build intent comment lines for one CALL statement."""
+    _name, actuals = parse_call_statement(stmt)
+    groups: Dict[str, List[str]] = {"in": [], "out": [], "inout": [], "none": []}
+    for ai, actual in enumerate(actuals):
+        kv = top_level_equals(actual)
+        label = (kv[1] if kv is not None else actual).strip()
+        if not label:
+            continue
+        fint = resolve_call_formal_intent(sig, actual, ai)
+        if fint == "in":
+            groups["in"].append(label)
+        elif fint == "out":
+            groups["out"].append(label)
+        elif fint == "inout":
+            groups["inout"].append(label)
+        else:
+            groups["none"].append(label)
+    comments: List[str] = []
+    if groups["in"]:
+        comments.append(f"{indent}! intent(in): {', '.join(groups['in'])}\n")
+    if groups["out"]:
+        comments.append(f"{indent}! intent(out): {', '.join(groups['out'])}\n")
+    if groups["inout"]:
+        comments.append(f"{indent}! intent(inout): {', '.join(groups['inout'])}\n")
+    if groups["none"]:
+        comments.append(f"{indent}! no intent: {', '.join(groups['none'])}\n")
+    return comments
+
+
+def annotate_calls_in_file(
+    finfo: fscan.SourceFileInfo,
+    call_sigs: Dict[str, Optional[CallSignature]],
+) -> Tuple[List[str], int]:
+    """Return rewritten lines with intent comments after resolved CALL statements."""
+    lines = list(finfo.lines)
+    edits: Dict[int, List[str]] = {}
+    skip_lines: Set[int] = set()
+    in_interface = 0
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        code, _comment = split_code_comment(raw.rstrip("\r\n"))
+        low = code.strip().lower()
+        if INTERFACE_START_RE.match(low):
+            in_interface += 1
+            i += 1
+            continue
+        if END_INTERFACE_RE.match(low):
+            if in_interface > 0:
+                in_interface -= 1
+            i += 1
+            continue
+        if in_interface:
+            i += 1
+            continue
+        end_i, stmt, _used = collect_continued_statement(lines, i)
+        m_call = re.match(r"^\s*call\s+([a-z][a-z0-9_]*)\b", stmt.strip(), re.IGNORECASE)
+        if not m_call:
+            i = end_i
+            continue
+        sig = call_sigs.get(m_call.group(1).lower())
+        if not isinstance(sig, CallSignature):
+            i = end_i
+            continue
+        indent = re.match(r"^\s*", lines[end_i - 1]).group(0)
+        comments = build_call_annotation_comments(stmt, sig, indent)
+        if comments:
+            edits[end_i] = comments
+            j = end_i
+            while j < len(lines):
+                nxt = lines[j].rstrip("\r\n")
+                if re.match(r"^\s*!\s*(intent\s*\((?:in|out|inout)\)\s*:|no intent:)", nxt, re.IGNORECASE):
+                    skip_lines.add(j + 1)
+                    j += 1
+                    continue
+                if nxt.strip() == "":
+                    break
+                break
+        i = end_i
+    if not edits:
+        return [ln if ln.endswith("\n") else ln + "\n" for ln in lines], 0
+    out_lines: List[str] = []
+    count = 0
+    for idx, raw in enumerate(lines, start=1):
+        if idx in skip_lines:
+            continue
+        out_lines.append(raw if raw.endswith("\n") else raw + "\n")
+        if idx in edits:
+            out_lines.extend(edits[idx])
+            count += 1
+    return out_lines, count
+
+
 def is_definitely_nonvariable_actual(expr: str) -> bool:
     """Return True when an actual argument is definitely not a variable designator."""
     s = expr.strip()
@@ -1963,6 +2098,11 @@ def main() -> int:
         help="Report declared INTENT(OUT) dummies that are never wholly assigned",
     )
     parser.add_argument(
+        "--annotate-calls",
+        action="store_true",
+        help="With --fix/--out, add comment lines after resolved CALL statements listing argument intents",
+    )
+    parser.add_argument(
         "--suggest-intent-out",
         action="store_true",
         help="Suggest/apply INTENT(OUT) (default is INTENT(IN))",
@@ -1990,6 +2130,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.out is not None:
         args.fix = True
+    if args.annotate_calls and not args.fix:
+        print("--annotate-calls requires --fix or --out.")
+        return 3
     if args.iterate and not args.fix:
         print("--iterate requires --fix.")
         return 3
@@ -2007,6 +2150,9 @@ def main() -> int:
         return 3
     if args.out is not None and args.git:
         print("--out is not supported with --git.")
+        return 3
+    if args.annotate_calls and args.iterate:
+        print("--annotate-calls is not supported with --iterate.")
         return 3
 
     args.fortran_files = cpaths.expand_path_args(args.fortran_files)
@@ -2031,6 +2177,7 @@ def main() -> int:
     changed_summary: Dict[Tuple[str, str], List[str]] = {}
     changed_files: Set[Path] = set()
     suggest_summary_last: Dict[Tuple[str, str], List[str]] = {}
+    annotated_calls_total = 0
     max_passes = args.max_iter if args.iterate else 1
     did_baseline_compile = False
     baseline_failed = False
@@ -2060,7 +2207,7 @@ def main() -> int:
         pass_suggest_summary: Dict[Tuple[str, str], List[str]] = {}
         backup_pairs: List[Tuple[Path, Path]] = []
         pass_changed = 0
-        call_sigs = collect_proc_call_signatures(ordered_files) if args.interproc else None
+        call_sigs = collect_proc_call_signatures(ordered_files) if (args.interproc or args.annotate_calls) else None
         nonvariable_actual_formals: Optional[Dict[str, Set[str]]] = None
         if args.interproc and call_sigs is not None:
             nonvariable_actual_formals = collect_nonvariable_actual_formals(ordered_files, call_sigs)
@@ -2121,6 +2268,27 @@ def main() -> int:
                     print(f"\nApplied INTENT(IN/OUT) to {changed} declaration(s).")
                 else:
                     print(f"\nApplied INTENT(IN) to {changed} declaration(s).")
+            if args.annotate_calls and isinstance(call_sigs, dict):
+                target_path = args.out if args.out is not None else finfo.path
+                if args.out is not None:
+                    target_path.write_text("".join(finfo.lines), encoding="utf-8", newline="")
+                text = target_path.read_text(encoding="utf-8")
+                annotated_finfo = fscan.SourceFileInfo(
+                    path=target_path,
+                    lines=text.splitlines(keepends=True),
+                    parsed_lines=text.splitlines(),
+                    procedures=fscan.parse_procedures(text.splitlines()),
+                    defined_modules=finfo.defined_modules,
+                    used_modules=finfo.used_modules,
+                    generic_interfaces=finfo.generic_interfaces,
+                )
+                annotated_lines, n_annot = annotate_calls_in_file(annotated_finfo, call_sigs)
+                if n_annot > 0:
+                    target_path.write_text("".join(annotated_lines), encoding="utf-8", newline="")
+                    annotated_calls_total += n_annot
+                    changed_files.add(target_path if args.out is not None else finfo.path)
+                    if args.verbose:
+                        print(f"Annotated {n_annot} CALL statement(s) in {fscan.display_path(target_path)}")
 
         if args.compiler:
             phase = "after-fix" if args.fix else "current"
@@ -2148,6 +2316,8 @@ def main() -> int:
             changed_summary,
             "intent(in/out)" if args.suggest_intent_out else "intent(in)",
         )
+        if args.annotate_calls:
+            print(f"\nAnnotated {annotated_calls_total} CALL statement(s).")
         if args.suggest_intent_out:
             print_summary(changed_summary, label="with arguments marked intent(in/out)")
         else:
