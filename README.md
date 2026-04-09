@@ -115,18 +115,3 @@ So warnings should be read as:
 - “definitely safe” suggestions for simple `intent(in)` cases
 - “likely” or “may be unset” diagnostics for more complex `intent(out)` cases
 
-## Suggested repository contents
-
-A minimal standalone repo would typically include:
-
-- `xintent.py`
-- `fortran_scan.py`
-- `fortran_build.py`
-- `cli_paths.py`
-- a few example files such as:
-  - `xintent_out.f90`
-  - `xintent_out_2d.f90`
-
-## License / status
-
-This project is best viewed as a practical developer tool under active evolution rather than a polished full Fortran verifier.
